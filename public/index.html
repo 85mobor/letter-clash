@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Letter Clash</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape bg-shape-a"></div>
+    <div class="bg-shape bg-shape-b"></div>
+    <main class="app-shell">
+      <header class="hero">
+        <p class="eyebrow">Browser Party Game</p>
+        <h1>Letter Clash</h1>
+        <p class="subhead">
+          Pick a letter. Challenge a friend. Beat the clock. Play online from anywhere or pass one device around.
+        </p>
+      </header>
+
+      <section id="homeView" class="view active">
+        <div class="mode-switch" role="tablist" aria-label="Game mode">
+          <button id="modeLocal" class="mode-btn active" type="button">Local Shared Device</button>
+          <button id="modeOnline" class="mode-btn" type="button">Online Room</button>
+        </div>
+
+        <div id="localSetupPanel" class="panel">
+          <h2>Local Session Setup</h2>
+          <p class="panel-note">2-4 players. One device. Turns are hidden with a handoff screen.</p>
+
+          <div id="localPlayers" class="player-input-grid"></div>
+
+          <div class="control-row">
+            <button id="addLocalPlayer" type="button" class="ghost-btn">Add Player</button>
+            <button id="removeLocalPlayer" type="button" class="ghost-btn">Remove Player</button>
+          </div>
+
+          <label class="field-label" for="localRounds">Rounds Per Player</label>
+          <input id="localRounds" type="number" min="1" max="10" value="5" class="text-input compact" />
+
+          <button id="startLocalBtn" type="button" class="primary-btn">Start Local Game</button>
+        </div>
+
+        <div id="onlineSetupPanel" class="panel hidden">
+          <h2>Online Room Setup</h2>
+          <p class="panel-note">Share your room code so friends can join from any browser.</p>
+
+          <label class="field-label" for="onlineName">Your Name</label>
+          <input id="onlineName" type="text" maxlength="24" placeholder="Enter your name" class="text-input" />
+
+          <label class="field-label" for="onlineRounds">Rounds Per Player (host sets this)</label>
+          <input id="onlineRounds" type="number" min="1" max="10" value="5" class="text-input compact" />
+
+          <div class="online-actions">
+            <button id="createRoomBtn" type="button" class="primary-btn">Create Room</button>
+          </div>
+
+          <div class="join-wrap">
+            <input id="joinCode" type="text" maxlength="6" placeholder="Room code" class="text-input compact" />
+            <button id="joinRoomBtn" type="button" class="ghost-btn">Join Room</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="lobbyView" class="view hidden">
+        <div class="panel">
+          <h2>Room Lobby</h2>
+          <p class="room-code-wrap">
+            Room Code:
+            <span id="roomCode" class="room-code">-----</span>
+            <button id="copyCodeBtn" type="button" class="ghost-btn tiny">Copy</button>
+          </p>
+
+          <div class="lobby-grid">
+            <div>
+              <h3>Players</h3>
+              <ul id="lobbyPlayers" class="simple-list"></ul>
+            </div>
+            <div>
+              <label class="field-label" for="lobbyRounds">Rounds Per Player</label>
+              <input id="lobbyRounds" type="number" min="1" max="10" value="5" class="text-input compact" />
+              <button id="startOnlineBtn" type="button" class="primary-btn">Start Match</button>
+              <button id="leaveRoomBtn" type="button" class="ghost-btn">Leave Room</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="gameView" class="view hidden">
+        <div class="game-status">
+          <span id="phaseBadge" class="badge">Waiting</span>
+          <span id="roundStatus" class="badge secondary">Round 0</span>
+          <span id="timerChip" class="timer-chip">60s</span>
+        </div>
+
+        <div class="game-grid">
+          <aside class="panel leaderboard-panel">
+            <h3>Leaderboard</h3>
+            <div id="scoreboard"></div>
+          </aside>
+
+          <section class="panel stage-panel">
+            <div id="setupPanel" class="stage-block hidden">
+              <h2 id="setupTitle">Choose the challenge</h2>
+              <p id="setupHint" class="panel-note"></p>
+
+              <label class="field-label" for="letterSelect">Letter</label>
+              <div class="letter-row">
+                <select id="letterSelect" class="text-input compact"></select>
+                <button id="randomLetterBtn" type="button" class="ghost-btn">Random</button>
+              </div>
+
+              <div id="opponentSelectWrap">
+                <p class="field-label">Opponent</p>
+                <div id="opponentButtons" class="opponent-grid"></div>
+              </div>
+
+              <button id="beginTurnBtn" type="button" class="primary-btn">Begin 60s Challenge</button>
+            </div>
+
+            <div id="answerPanel" class="stage-block hidden">
+              <h2 id="answerTitle">Answer Time</h2>
+              <p id="answerHint" class="panel-note"></p>
+
+              <form id="answerForm" class="answer-form">
+                <label class="field-label" for="answerName">Name</label>
+                <input id="answerName" name="name" class="text-input" autocomplete="off" />
+
+                <label class="field-label" for="answerPlace">Place (city/country)</label>
+                <input id="answerPlace" name="place" class="text-input" autocomplete="off" />
+
+                <label class="field-label" for="answerAnimal">Animal</label>
+                <input id="answerAnimal" name="animal" class="text-input" autocomplete="off" />
+
+                <label class="field-label" for="answerThing">Random Thing</label>
+                <input id="answerThing" name="thing" class="text-input" autocomplete="off" />
+
+                <button id="submitAnswersBtn" type="submit" class="primary-btn">Submit (Enter)</button>
+              </form>
+            </div>
+
+            <div id="waitingPanel" class="stage-block hidden">
+              <h2 id="waitingTitle">Waiting...</h2>
+              <p id="waitingHint" class="panel-note"></p>
+            </div>
+
+            <div id="resultPanel" class="stage-block hidden">
+              <h2>Round Result</h2>
+              <p id="resultSummary" class="panel-note"></p>
+              <div id="resultFields" class="result-grid"></div>
+              <div id="resultScoreBreakdown" class="score-breakdown"></div>
+              <button id="continueBtn" type="button" class="primary-btn">Next Turn</button>
+            </div>
+
+            <div id="finalPanel" class="stage-block hidden">
+              <h2>Final Scores</h2>
+              <div id="finalScores"></div>
+              <div class="control-row">
+                <button id="newSessionBtn" type="button" class="primary-btn">New Session</button>
+                <button id="backHomeBtn" type="button" class="ghost-btn">Back Home</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <div id="passOverlay" class="pass-overlay hidden">
+      <div class="pass-card">
+        <p class="eyebrow">Private Turn</p>
+        <h2 id="passTitle">Pass device to player</h2>
+        <p id="passHint" class="panel-note"></p>
+        <button id="revealTurnBtn" type="button" class="primary-btn">Reveal Turn</button>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
