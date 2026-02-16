@@ -1,7 +1,17 @@
+const fs = require("fs");
 const path = require("path");
+const vm = require("vm");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+
+const allCities = require("all-the-cities");
+const worldCountries = require("world-countries");
+const countryPopulationRows = require("country-json/src/country-by-population.json");
+const maleFirstNames = require("@stdlib/datasets-male-first-names-en")();
+const femaleFirstNames = require("@stdlib/datasets-female-first-names-en")();
+const animals = require("animals").words;
+const englishWords = require("an-array-of-english-words");
 
 const app = express();
 const server = http.createServer(app);
@@ -11,13 +21,582 @@ const PORT = process.env.PORT || 3000;
 const ROUND_TIME_SECONDS = 60;
 const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 4;
+const CATEGORIES = ["name", "place", "animal", "thing"];
+
+const IRREGULAR_SINGULARS = new Map([
+  ["mice", "mouse"],
+  ["geese", "goose"],
+  ["teeth", "tooth"],
+  ["feet", "foot"],
+  ["wolves", "wolf"],
+  ["leaves", "leaf"],
+  ["children", "child"],
+  ["men", "man"],
+  ["women", "woman"]
+]);
 
 const rooms = new Map();
 
+app.use(express.json({ limit: "64kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, rooms: rooms.size });
+});
+
+function clamp01(value) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizeLookup(raw) {
+  return String(raw || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s'-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function singularizeSimple(word) {
+  const input = normalizeLookup(word);
+  if (!input) {
+    return "";
+  }
+  if (IRREGULAR_SINGULARS.has(input)) {
+    return IRREGULAR_SINGULARS.get(input);
+  }
+  if (input.endsWith("ies") && input.length > 4) {
+    return `${input.slice(0, -3)}y`;
+  }
+  if (input.endsWith("ves") && input.length > 4) {
+    return `${input.slice(0, -3)}f`;
+  }
+  if (input.endsWith("es") && input.length > 3) {
+    return input.slice(0, -2);
+  }
+  if (input.endsWith("s") && input.length > 2) {
+    return input.slice(0, -1);
+  }
+  return input;
+}
+
+function startsWithLetter(text, letter) {
+  if (!text || !letter) {
+    return false;
+  }
+  const normalized = normalizeLookup(text);
+  const first = normalized.match(/[a-z]/);
+  return Boolean(first && first[0].toUpperCase() === letter);
+}
+
+function normalizeAnswer(raw) {
+  if (typeof raw !== "string") {
+    return "";
+  }
+  return raw.trim().replace(/\s+/g, " ");
+}
+
+function loadPopularWordRanks() {
+  try {
+    const wordsFile = path.join(__dirname, "node_modules", "popular-english-words", "words.js");
+    const raw = fs.readFileSync(wordsFile, "utf8");
+    const executable = raw.replace(/\nexport\s+\{words\}\s*;?\s*$/, "\nmodule.exports = words;");
+    const sandbox = { module: { exports: [] } };
+    vm.runInNewContext(executable, sandbox);
+
+    const list = Array.isArray(sandbox.module.exports) ? sandbox.module.exports : [];
+    const rankByWord = new Map();
+
+    for (let idx = 0; idx < list.length; idx += 1) {
+      const key = normalizeLookup(list[idx]);
+      if (!key || rankByWord.has(key)) {
+        continue;
+      }
+      rankByWord.set(key, idx);
+    }
+
+    return {
+      rankByWord,
+      wordCount: list.length
+    };
+  } catch (error) {
+    console.warn("Failed to load popularity ranks:", error.message);
+    return {
+      rankByWord: new Map(),
+      wordCount: 0
+    };
+  }
+}
+
+const POPULAR_WORDS = loadPopularWordRanks();
+
+function toPopulationValue(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function createPopulationBounds(populationMap) {
+  let minLog = Infinity;
+  let maxLog = -Infinity;
+
+  for (const population of populationMap.values()) {
+    if (!Number.isFinite(population) || population <= 0) {
+      continue;
+    }
+    const logPop = Math.log10(population);
+    minLog = Math.min(minLog, logPop);
+    maxLog = Math.max(maxLog, logPop);
+  }
+
+  if (!Number.isFinite(minLog) || !Number.isFinite(maxLog) || minLog === maxLog) {
+    return { minLog: 1, maxLog: 8 };
+  }
+
+  return { minLog, maxLog };
+}
+
+function commonnessFromPopulation(population, bounds) {
+  if (!Number.isFinite(population) || population <= 0) {
+    return 0.25;
+  }
+  const logPop = Math.log10(population);
+  return clamp01((logPop - bounds.minLog) / (bounds.maxLog - bounds.minLog));
+}
+
+function commonnessFromWord(term) {
+  const normalized = normalizeLookup(term);
+  if (!normalized || POPULAR_WORDS.wordCount === 0) {
+    return null;
+  }
+
+  const candidates = new Set([normalized]);
+  const singular = singularizeSimple(normalized);
+  if (singular) {
+    candidates.add(singular);
+  }
+
+  const tokenized = normalized.split(/[\s-]+/).filter(Boolean);
+  for (const token of tokenized) {
+    candidates.add(token);
+    const singularToken = singularizeSimple(token);
+    if (singularToken) {
+      candidates.add(singularToken);
+    }
+  }
+
+  let bestRank = Infinity;
+  for (const candidate of candidates) {
+    const rank = POPULAR_WORDS.rankByWord.get(candidate);
+    if (Number.isFinite(rank) && rank < bestRank) {
+      bestRank = rank;
+    }
+  }
+
+  if (!Number.isFinite(bestRank)) {
+    return null;
+  }
+
+  return clamp01(1 - bestRank / Math.max(1, POPULAR_WORDS.wordCount - 1));
+}
+
+function scoreFromCommonness(commonness) {
+  const value = clamp01(commonness);
+  const points = Math.round(8 + (1 - value) * 15);
+
+  let difficultyLabel = "Uncommon";
+  if (value >= 0.82) {
+    difficultyLabel = "Very Common";
+  } else if (value >= 0.62) {
+    difficultyLabel = "Common";
+  } else if (value >= 0.4) {
+    difficultyLabel = "Uncommon";
+  } else if (value >= 0.22) {
+    difficultyLabel = "Rare";
+  } else {
+    difficultyLabel = "Very Rare";
+  }
+
+  return {
+    points,
+    difficultyLabel,
+    commonness: Number(value.toFixed(3))
+  };
+}
+
+const NAME_SET = new Set(
+  [...maleFirstNames, ...femaleFirstNames]
+    .map((name) => normalizeLookup(name))
+    .filter(Boolean)
+);
+
+const ANIMAL_SET = new Set(
+  animals
+    .flatMap((animal) => {
+      const normalized = normalizeLookup(animal);
+      const singular = singularizeSimple(animal);
+      return [normalized, singular].filter(Boolean);
+    })
+    .filter(Boolean)
+);
+
+const THING_WORD_SET = new Set(
+  englishWords
+    .map((word) => normalizeLookup(word))
+    .filter(Boolean)
+);
+
+const CITY_POPULATION_BY_NAME = new Map();
+for (const city of allCities) {
+  const population = toPopulationValue(city.population, 1000);
+  const variants = [city.name, city.altName].filter(Boolean);
+
+  for (const variant of variants) {
+    const key = normalizeLookup(variant);
+    if (!key) {
+      continue;
+    }
+    const current = CITY_POPULATION_BY_NAME.get(key) || 0;
+    if (population > current) {
+      CITY_POPULATION_BY_NAME.set(key, population);
+    }
+  }
+}
+
+const COUNTRY_POPULATION_BY_NAME = new Map();
+for (const row of countryPopulationRows) {
+  const key = normalizeLookup(row.country);
+  if (!key) {
+    continue;
+  }
+  COUNTRY_POPULATION_BY_NAME.set(key, toPopulationValue(row.population, 100000));
+}
+
+for (const country of worldCountries) {
+  const variants = new Set();
+  if (country.name && country.name.common) {
+    variants.add(country.name.common);
+  }
+  if (country.name && country.name.official) {
+    variants.add(country.name.official);
+  }
+  if (Array.isArray(country.altSpellings)) {
+    country.altSpellings.forEach((value) => variants.add(value));
+  }
+
+  let knownPopulation = 0;
+  if (country.name && country.name.common) {
+    knownPopulation = COUNTRY_POPULATION_BY_NAME.get(normalizeLookup(country.name.common)) || 0;
+  }
+  if (!knownPopulation && country.name && country.name.official) {
+    knownPopulation = COUNTRY_POPULATION_BY_NAME.get(normalizeLookup(country.name.official)) || 0;
+  }
+  if (!knownPopulation) {
+    knownPopulation = 1000000;
+  }
+
+  for (const variant of variants) {
+    const key = normalizeLookup(variant);
+    if (!key) {
+      continue;
+    }
+    if (!COUNTRY_POPULATION_BY_NAME.has(key)) {
+      COUNTRY_POPULATION_BY_NAME.set(key, knownPopulation);
+    }
+  }
+}
+
+const CITY_POP_BOUNDS = createPopulationBounds(CITY_POPULATION_BY_NAME);
+const COUNTRY_POP_BOUNDS = createPopulationBounds(COUNTRY_POPULATION_BY_NAME);
+
+function validateNameAnswer(answer) {
+  const normalized = normalizeLookup(answer);
+  const firstToken = normalized.split(/[\s'-]+/).filter(Boolean)[0] || "";
+
+  if (!firstToken || !NAME_SET.has(firstToken)) {
+    return {
+      valid: false,
+      reason: "Not recognized as a common first name."
+    };
+  }
+
+  const commonness = commonnessFromWord(firstToken);
+  return {
+    valid: true,
+    commonness: commonness === null ? 0.55 : commonness
+  };
+}
+
+function validatePlaceAnswer(answer) {
+  const normalized = normalizeLookup(answer);
+  if (!normalized) {
+    return {
+      valid: false,
+      reason: "No place provided."
+    };
+  }
+
+  const candidates = new Set([
+    normalized,
+    normalized.replace(/\bcity\b/g, "").replace(/\s+/g, " ").trim()
+  ]);
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+
+    const countryPopulation = COUNTRY_POPULATION_BY_NAME.get(candidate);
+    if (countryPopulation) {
+      return {
+        valid: true,
+        commonness: commonnessFromPopulation(countryPopulation, COUNTRY_POP_BOUNDS),
+        detectedAs: "country"
+      };
+    }
+
+    const cityPopulation = CITY_POPULATION_BY_NAME.get(candidate);
+    if (cityPopulation) {
+      return {
+        valid: true,
+        commonness: commonnessFromPopulation(cityPopulation, CITY_POP_BOUNDS),
+        detectedAs: "city"
+      };
+    }
+  }
+
+  return {
+    valid: false,
+    reason: "Place not found in city/country data."
+  };
+}
+
+function validateAnimalAnswer(answer) {
+  const normalized = normalizeLookup(answer);
+  if (!normalized) {
+    return {
+      valid: false,
+      reason: "No animal provided."
+    };
+  }
+
+  const tokens = normalized.split(/[\s-]+/).filter(Boolean);
+  const lastToken = tokens[tokens.length - 1] || "";
+  const candidates = new Set([
+    normalized,
+    singularizeSimple(normalized),
+    lastToken,
+    singularizeSimple(lastToken)
+  ]);
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+    if (ANIMAL_SET.has(candidate)) {
+      const commonness = commonnessFromWord(candidate);
+      return {
+        valid: true,
+        commonness: commonness === null ? 0.35 : commonness
+      };
+    }
+  }
+
+  return {
+    valid: false,
+    reason: "Not recognized in the animal list."
+  };
+}
+
+function isThingWord(token) {
+  if (!token) {
+    return false;
+  }
+  if (THING_WORD_SET.has(token)) {
+    return true;
+  }
+  const singular = singularizeSimple(token);
+  return Boolean(singular && THING_WORD_SET.has(singular));
+}
+
+function validateThingAnswer(answer) {
+  const normalized = normalizeLookup(answer);
+  if (!normalized) {
+    return {
+      valid: false,
+      reason: "No thing provided."
+    };
+  }
+
+  if (CITY_POPULATION_BY_NAME.has(normalized) || COUNTRY_POPULATION_BY_NAME.has(normalized)) {
+    return {
+      valid: false,
+      reason: "That is a place, not a random thing."
+    };
+  }
+
+  const tokens = normalized.split(/[\s-]+/).filter(Boolean);
+  if (tokens.length === 0 || !tokens.every((token) => isThingWord(token))) {
+    return {
+      valid: false,
+      reason: "Not recognized as an English thing/object word."
+    };
+  }
+
+  if (tokens.length === 1) {
+    const single = tokens[0];
+    if (ANIMAL_SET.has(single) || NAME_SET.has(single)) {
+      return {
+        valid: false,
+        reason: "Looks like an animal or name, not a thing."
+      };
+    }
+  }
+
+  const commonness = commonnessFromWord(normalized);
+  return {
+    valid: true,
+    commonness: commonness === null ? 0.45 : commonness
+  };
+}
+
+function evaluateCategory(category, answer, letter) {
+  const cleaned = normalizeAnswer(answer);
+
+  if (!cleaned) {
+    return {
+      answer: "",
+      valid: false,
+      reason: "Blank answer.",
+      points: 0,
+      difficultyLabel: null,
+      commonness: null,
+      detectedAs: null
+    };
+  }
+
+  if (!startsWithLetter(cleaned, letter)) {
+    return {
+      answer: cleaned,
+      valid: false,
+      reason: `Must start with ${letter}.`,
+      points: 0,
+      difficultyLabel: null,
+      commonness: null,
+      detectedAs: null
+    };
+  }
+
+  let verdict = {
+    valid: false,
+    reason: "Invalid answer."
+  };
+
+  if (category === "name") {
+    verdict = validateNameAnswer(cleaned);
+  } else if (category === "place") {
+    verdict = validatePlaceAnswer(cleaned);
+  } else if (category === "animal") {
+    verdict = validateAnimalAnswer(cleaned);
+  } else if (category === "thing") {
+    verdict = validateThingAnswer(cleaned);
+  }
+
+  if (!verdict.valid) {
+    return {
+      answer: cleaned,
+      valid: false,
+      reason: verdict.reason || "Invalid answer.",
+      points: 0,
+      difficultyLabel: null,
+      commonness: null,
+      detectedAs: verdict.detectedAs || null
+    };
+  }
+
+  const score = scoreFromCommonness(verdict.commonness);
+  return {
+    answer: cleaned,
+    valid: true,
+    reason: null,
+    points: score.points,
+    difficultyLabel: score.difficultyLabel,
+    commonness: score.commonness,
+    detectedAs: verdict.detectedAs || null
+  };
+}
+
+function evaluateTurn(letter, answers, elapsedSeconds, streakBefore) {
+  const categoryDetails = {};
+  const normalizedAnswers = {};
+  const validity = {};
+
+  let validCount = 0;
+  let categoryPoints = 0;
+
+  for (const category of CATEGORIES) {
+    const detail = evaluateCategory(category, answers[category], letter);
+    categoryDetails[category] = detail;
+    normalizedAnswers[category] = detail.answer;
+    validity[category] = detail.valid;
+
+    if (detail.valid) {
+      validCount += 1;
+      categoryPoints += detail.points;
+    }
+  }
+
+  const participation = 8;
+  const speedBonus = Math.max(0, Math.round((ROUND_TIME_SECONDS - elapsedSeconds) * 0.5));
+  const completionBonus = validCount === CATEGORIES.length ? 15 : 0;
+  const streakBonus =
+    validCount === CATEGORIES.length && streakBefore > 0 ? Math.min(20, streakBefore * 4) : 0;
+
+  const total = participation + categoryPoints + speedBonus + completionBonus + streakBonus;
+
+  return {
+    normalizedAnswers,
+    validity,
+    categoryDetails,
+    elapsedSeconds,
+    validCount,
+    participation,
+    categoryPoints,
+    speedBonus,
+    completionBonus,
+    streakBonus,
+    total,
+    fullClear: validCount === CATEGORIES.length
+  };
+}
+
+app.post("/api/evaluate-turn", (req, res) => {
+  try {
+    const letter = sanitizeLetter(req.body.letter);
+    if (!letter) {
+      res.status(400).json({ ok: false, error: "Invalid letter." });
+      return;
+    }
+
+    const answers = req.body.answers && typeof req.body.answers === "object" ? req.body.answers : {};
+    const elapsedSeconds = Math.max(
+      0,
+      Math.min(ROUND_TIME_SECONDS, Number(req.body.elapsedSeconds) || 0)
+    );
+    const streakBefore = Math.max(0, Math.floor(Number(req.body.streakBefore) || 0));
+
+    const evaluation = evaluateTurn(letter, answers, elapsedSeconds, streakBefore);
+    res.json({ ok: true, evaluation });
+  } catch (error) {
+    console.error("Evaluation endpoint failed:", error);
+    res.status(500).json({ ok: false, error: "Failed to evaluate turn." });
+  }
 });
 
 function makeId(length = 6) {
@@ -54,21 +633,6 @@ function sanitizeLetter(letter) {
   }
   const first = letter.trim().charAt(0).toUpperCase();
   return /^[A-Z]$/.test(first) ? first : null;
-}
-
-function normalizeAnswer(raw) {
-  if (typeof raw !== "string") {
-    return "";
-  }
-  return raw.trim().replace(/\s+/g, " ");
-}
-
-function startsWithLetter(text, letter) {
-  if (!text || !letter) {
-    return false;
-  }
-  const first = text.trim().charAt(0).toUpperCase();
-  return first === letter;
 }
 
 function createPlayer(socketId, name) {
@@ -188,45 +752,6 @@ function emitRoom(room) {
   io.to(room.id).emit("room:update", publicRoomState(room));
 }
 
-function evaluateTurn(letter, answers, elapsedSeconds, streakBefore) {
-  const categories = ["name", "place", "animal", "thing"];
-  const normalizedAnswers = {};
-  const validity = {};
-  let validCount = 0;
-
-  for (const category of categories) {
-    const cleaned = normalizeAnswer(answers[category]);
-    normalizedAnswers[category] = cleaned;
-    const valid = startsWithLetter(cleaned, letter);
-    validity[category] = valid;
-    if (valid) {
-      validCount += 1;
-    }
-  }
-
-  const participation = 8;
-  const categoryPoints = validCount * 15;
-  const speedBonus = Math.max(0, Math.round((ROUND_TIME_SECONDS - elapsedSeconds) * 0.5));
-  const completionBonus = validCount === categories.length ? 20 : 0;
-  const streakBonus = validCount === categories.length && streakBefore > 0 ? Math.min(15, streakBefore * 5) : 0;
-
-  const total = participation + categoryPoints + speedBonus + completionBonus + streakBonus;
-
-  return {
-    normalizedAnswers,
-    validity,
-    elapsedSeconds,
-    validCount,
-    participation,
-    categoryPoints,
-    speedBonus,
-    completionBonus,
-    streakBonus,
-    total,
-    fullClear: validCount === categories.length
-  };
-}
-
 function moveToNextStep(room) {
   if (allPlayersDone(room)) {
     room.state.phase = "finished";
@@ -274,12 +799,7 @@ function finalizeSubmission(room, opponentId, rawAnswers = {}, timedOut = false)
     Math.min(ROUND_TIME_SECONDS, Math.round((now - startedAt) / 1000))
   );
 
-  const evaluation = evaluateTurn(
-    room.state.selectedLetter,
-    rawAnswers,
-    elapsedSeconds,
-    opponent.streak
-  );
+  const evaluation = evaluateTurn(room.state.selectedLetter, rawAnswers, elapsedSeconds, opponent.streak);
 
   opponent.score += evaluation.total;
   opponent.roundsCompleted += 1;
@@ -300,6 +820,7 @@ function finalizeSubmission(room, opponentId, rawAnswers = {}, timedOut = false)
     letter: room.state.selectedLetter,
     answers: evaluation.normalizedAnswers,
     validity: evaluation.validity,
+    categoryDetails: evaluation.categoryDetails,
     elapsedSeconds,
     timedOut,
     scoreBreakdown: {

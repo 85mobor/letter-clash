@@ -93,7 +93,8 @@
       selectedOpponentId: null,
       answerTurnKey: null,
       localRevealKey: null,
-      awaitingReveal: false
+      awaitingReveal: false,
+      localSubmitInFlight: false
     },
     timers: {
       countdownInterval: null,
@@ -135,25 +136,27 @@
     return String(raw || "").trim().replace(/\s+/g, " ");
   }
 
-  function startsWithLetter(text, letter) {
-    const normalized = normalizeAnswer(text);
-    if (!normalized || !letter) {
-      return false;
-    }
-    return normalized.charAt(0).toUpperCase() === letter;
-  }
-
-  function evaluateTurn(letter, answers, elapsedSeconds, streakBefore) {
+  function fallbackEvaluateTurn(letter, answers, elapsedSeconds, streakBefore) {
     const categories = ["name", "place", "animal", "thing"];
     let validCount = 0;
     const normalizedAnswers = {};
     const validity = {};
+    const categoryDetails = {};
 
     categories.forEach((category) => {
       const cleaned = normalizeAnswer(answers[category]);
       normalizedAnswers[category] = cleaned;
-      const valid = startsWithLetter(cleaned, letter);
+      const valid = cleaned && cleaned.charAt(0).toUpperCase() === letter;
       validity[category] = valid;
+      categoryDetails[category] = {
+        answer: cleaned,
+        valid,
+        reason: valid ? null : `Must start with ${letter}.`,
+        points: valid ? 15 : 0,
+        difficultyLabel: valid ? "Fallback" : null,
+        commonness: null,
+        detectedAs: null
+      };
       if (valid) {
         validCount += 1;
       }
@@ -169,6 +172,7 @@
     return {
       normalizedAnswers,
       validity,
+      categoryDetails,
       validCount,
       participation,
       categoryPoints,
@@ -179,6 +183,31 @@
       fullClear: validCount === 4,
       elapsedSeconds
     };
+  }
+
+  async function requestTurnEvaluation(letter, answers, elapsedSeconds, streakBefore) {
+    try {
+      const response = await fetch("/api/evaluate-turn", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          letter,
+          answers,
+          elapsedSeconds,
+          streakBefore
+        })
+      });
+
+      const payload = await response.json();
+      if (!response.ok || !payload.ok || !payload.evaluation) {
+        return null;
+      }
+      return payload.evaluation;
+    } catch (_error) {
+      return null;
+    }
   }
 
   function showToast(message) {
@@ -362,6 +391,7 @@
     appState.ui.answerTurnKey = null;
     appState.ui.localRevealKey = null;
     appState.ui.awaitingReveal = false;
+    appState.ui.localSubmitInFlight = false;
     resetAnswerForm();
     render();
   }
@@ -425,9 +455,9 @@
     }, ROUND_TIME_SECONDS * 1000 + 30);
   }
 
-  function submitLocalTurn(answers, timedOut) {
+  async function submitLocalTurn(answers, timedOut) {
     const room = appState.local;
-    if (!room || room.state.phase !== "answering") {
+    if (!room || room.state.phase !== "answering" || appState.ui.localSubmitInFlight) {
       return;
     }
 
@@ -443,7 +473,15 @@
       Math.min(ROUND_TIME_SECONDS, Math.round((now - startedAt) / 1000))
     );
 
-    const result = evaluateTurn(room.state.selectedLetter, answers, elapsedSeconds, opponent.streak);
+    appState.ui.localSubmitInFlight = true;
+    const result =
+      (await requestTurnEvaluation(
+        room.state.selectedLetter,
+        answers,
+        elapsedSeconds,
+        opponent.streak
+      )) || fallbackEvaluateTurn(room.state.selectedLetter, answers, elapsedSeconds, opponent.streak);
+    appState.ui.localSubmitInFlight = false;
 
     opponent.score += result.total;
     opponent.roundsCompleted += 1;
@@ -465,6 +503,7 @@
       letter: room.state.selectedLetter,
       answers: result.normalizedAnswers,
       validity: result.validity,
+      categoryDetails: result.categoryDetails || {},
       elapsedSeconds,
       timedOut,
       scoreBreakdown: {
@@ -804,7 +843,8 @@
     clearStagePanels();
     els.setupPanel.classList.remove("hidden");
     els.setupTitle.textContent = `${selector.name}, set this round`;
-    els.setupHint.textContent = "Pick a letter and choose who answers. Faster correct answers score more points.";
+    els.setupHint.textContent =
+      "Pick a letter and choose who answers. Correct rarer answers score higher, and speed still matters.";
 
     els.letterSelect.value = appState.ui.selectedLetter;
 
@@ -892,7 +932,7 @@
     }
 
     els.answerTitle.textContent = `${opponent.name}, your turn`;
-    els.answerHint.textContent = `Use letter ${room.state.selectedLetter} for all answers. Submit early for speed bonus.`;
+    els.answerHint.textContent = `Use letter ${room.state.selectedLetter} for all answers. Answers are validated by category and rarity.`;
   }
 
   function renderResultPanel(room) {
@@ -924,11 +964,21 @@
       .map((field) => {
         const valid = Boolean(result.validity[field]);
         const value = result.answers[field] || "(blank)";
+        const detail = result.categoryDetails ? result.categoryDetails[field] : null;
+        const detectedAs =
+          detail && detail.detectedAs ? ` (${String(detail.detectedAs).toUpperCase()})` : "";
+        const statusText = valid
+          ? `${detail && detail.difficultyLabel ? detail.difficultyLabel : "Valid"}${detectedAs} • +${
+              detail && Number.isFinite(detail.points) ? detail.points : 0
+            }`
+          : detail && detail.reason
+            ? detail.reason
+            : "No point";
         return `
           <div class="result-cell ${valid ? "good" : "bad"}">
             <strong>${labelByField[field]}</strong>
             <p>${value}</p>
-            <small>${valid ? "Valid" : "No point"}</small>
+            <small>${statusText}</small>
           </div>
         `;
       })
@@ -937,7 +987,7 @@
     const b = result.scoreBreakdown;
     els.resultScoreBreakdown.innerHTML = `
       <p>Participation: +${b.participation}</p>
-      <p>Valid answers (${b.validCount}/4): +${b.categoryPoints}</p>
+      <p>Answer quality (${b.validCount}/4): +${b.categoryPoints}</p>
       <p>Speed bonus (${result.elapsedSeconds}s): +${b.speedBonus}</p>
       <p>All-correct bonus: +${b.completionBonus}</p>
       <p>Streak bonus: +${b.streakBonus}</p>

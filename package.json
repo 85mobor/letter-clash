@@ -8,7 +8,15 @@
     "dev": "node server.js"
   },
   "dependencies": {
+    "@stdlib/datasets-female-first-names-en": "^0.2.3",
+    "@stdlib/datasets-male-first-names-en": "^0.2.3",
+    "all-the-cities": "^3.1.0",
+    "an-array-of-english-words": "^2.0.0",
+    "animals": "^0.0.3",
+    "country-json": "^2.3.0",
     "express": "^4.19.2",
-    "socket.io": "^4.8.1"
+    "popular-english-words": "^1.0.2",
+    "socket.io": "^4.8.1",
+    "world-countries": "^5.1.0"
   }
 }
